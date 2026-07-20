@@ -447,4 +447,3 @@ The validation script distinguishes exact canonical intent matches from accepted
 8. Submit an analyst review showing either agreement or override.
 9. Confirm that review history appears and case status updates.
 10. Restart Streamlit and confirm persistence from the sidebar counts or by calling `storage.get_case_with_history(...)`.
-
