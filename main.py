@@ -9,8 +9,24 @@ import typing
 import urllib.error
 import urllib.request
 
+import storage
+import watchlist
+
 # Intent scoring
 INTENT_SCORES = {"malicious": 3, "suspicious": 2, "dual_use": 1, "benign": 0}
+CANONICAL_INTENTS = tuple(INTENT_SCORES.keys())
+SCORING_VERSION = "deterministic-scoring-v1"
+PRIORITY_POLICY_VERSION = "intent-floor-priority-v1"
+WATCHLIST_POLICY_VERSION = watchlist.WATCHLIST_POLICY_VERSION
+PRIORITY_LOW_MAX = 2
+PRIORITY_REVIEW_MAX = 5
+PRIORITY_RANKS = {"Low": 0, "Review": 1, "Escalate": 2}
+MINIMUM_PRIORITY_BY_INTENT = {
+	"benign": "Low",
+	"dual_use": "Review",
+	"suspicious": "Review",
+	"malicious": "Escalate",
+}
 
 # Hazard materials
 PRECURSOR_CHEMICALS = ["chlorine", "cyanide", "phosgene", "ammonia", "hydrogen sulfide", "sarin"]
@@ -138,7 +154,7 @@ def _has_strong_harmful_indicators(indicators) -> bool:
 	return any(ind.startswith("evasion:") or ind.startswith("delivery:") for ind in indicators)
 
 
-def load_and_print(csv_path, db_path="reports.db"):
+def load_and_print(csv_path, db_path="reports.db", rule_only: bool = False):
 	try:
 		# ensure DB/table exists
 		init_db(db_path)
@@ -160,7 +176,7 @@ def load_and_print(csv_path, db_path="reports.db"):
 
 				print(format_report(row))
 
-				analysis = analyze_report(row)
+				analysis = analyze_report(row, rule_only=rule_only)
 
 				print('\nAnalysis (JSON):')
 				try:
@@ -192,6 +208,12 @@ def load_and_print(csv_path, db_path="reports.db"):
 					"indicators": analysis.get("indicators") or [],
 					"summary": analysis.get("summary"),
 					"risk_score": risk,
+					"score_details": analysis.get("score_details"),
+					"scoring_version": analysis.get("scoring_version"),
+					"priority_policy_version": analysis.get("priority_policy_version"),
+					"hard_flags": analysis.get("hard_flags") or [],
+					"watchlist_version": analysis.get("watchlist_version"),
+					"watchlist_policy_version": analysis.get("watchlist_policy_version"),
 				}
 
 				try:
@@ -212,67 +234,71 @@ def parse_args():
 	p.add_argument("path", nargs="?", default="reports.csv", help="Path to CSV file (default: reports.csv)")
 	p.add_argument("--db", dest="db", default="reports.db", help="Path to SQLite DB file (default: reports.db)")
 	p.add_argument("--queries", dest="queries", action="store_true", help="Run summary SQLite queries after processing")
+	p.add_argument("--rule-only", dest="rule_only", action="store_true", help="Disable LLM calls and use deterministic rules only")
 	return p.parse_args()
 
 
 def main():
 	args = parse_args()
-	load_and_print(args.path, args.db)
+	load_and_print(args.path, args.db, rule_only=args.rule_only)
 
 	if getattr(args, "queries", False):
 		run_queries(args.db)
 
 
 def print_high_risk(db_path: str, threshold: int = 5):
-	rows = _fetch_all(
-		db_path,
-		"""
-		SELECT report_id, timestamp, source, intent, risk_score
-		FROM reports
-		WHERE risk_score >= ?
-		ORDER BY risk_score DESC, timestamp
-		""",
-		(threshold,),
-	)
+	rows = storage.get_cases_for_review_queue(db_path, minimum_risk_score=threshold)
 	print('\nHigh-risk reports (risk_score >= {}):'.format(threshold))
 	if not rows:
 		print(' - None')
 	else:
 		for r in rows:
-			print(f" - id={r[0]} | time={r[1]} | source={r[2]} | intent={r[3]} | risk={r[4]}")
+			print(
+				f" - id={r['case_id']} | time={r['created_at']} | source={r['source']} | "
+				f"intent={r['automated_intent']} | risk={r['numeric_risk_score']}"
+			)
 
 
 def count_high_by_source(db_path: str, threshold: int = 5):
-	rows = _fetch_all(
-		db_path,
-		"""
-		SELECT source, COUNT(*)
-		FROM reports
-		WHERE risk_score >= ?
-		GROUP BY source
-		ORDER BY COUNT(*) DESC, source
-		""",
-		(threshold,),
-	)
+	conn = storage.connect(db_path)
+	try:
+		rows = conn.execute(
+			"""
+			SELECT c.source, COUNT(*) AS count
+			FROM cases c
+			JOIN analyses a ON a.case_id = c.case_id
+			WHERE a.analysis_id = (
+				SELECT MAX(a2.analysis_id)
+				FROM analyses a2
+				WHERE a2.case_id = c.case_id
+			)
+			AND a.numeric_risk_score >= ?
+			GROUP BY c.source
+			ORDER BY COUNT(*) DESC, c.source
+			""",
+			(threshold,),
+		).fetchall()
+	finally:
+		conn.close()
 	print('\nHigh-risk report counts by source (risk_score >= {}):'.format(threshold))
 	if not rows:
 		print(' - None')
 	else:
 		for r in rows:
-			print(f" - source={r[0]} | count={r[1]}")
+			print(f" - source={r['source']} | count={r['count']}")
 
 
 def list_reports_by_risk(db_path: str):
-	rows = _fetch_all(
-		db_path,
-		"SELECT report_id, timestamp, source, intent, risk_score FROM reports ORDER BY risk_score DESC, timestamp",
-	)
+	rows = storage.get_cases_for_review_queue(db_path)
 	print('\nAll reports ordered by risk (highest first):')
 	if not rows:
 		print(' - None')
 	else:
 		for r in rows:
-			print(f" - id={r[0]} | risk={r[4]} | time={r[1]} | source={r[2]} | intent={r[3]}")
+			print(
+				f" - id={r['case_id']} | risk={r['numeric_risk_score']} | "
+				f"time={r['created_at']} | source={r['source']} | intent={r['automated_intent']}"
+			)
 
 
 def run_queries(db_path: str):
@@ -283,48 +309,38 @@ def run_queries(db_path: str):
 
 
 def init_db(db_path: str):
-	conn = sqlite3.connect(db_path)
-	try:
-		cur = conn.cursor()
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS reports (
-				report_id TEXT,
-				text TEXT,
-				timestamp TEXT,
-				source TEXT,
-				intent TEXT,
-				indicators TEXT,
-				summary TEXT,
-				risk_score INTEGER
-			)
-			"""
-		)
-		conn.commit()
-	finally:
-		conn.close()
+	storage.initialize_database(db_path)
 
 
 def insert_report(db_path: str, record: dict):
-	conn = sqlite3.connect(db_path)
-	try:
-		cur = conn.cursor()
-		cur.execute(
-			"INSERT INTO reports (report_id, text, timestamp, source, intent, indicators, summary, risk_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			(
-				record.get("report_id"),
-				record.get("text"),
-				record.get("timestamp"),
-				record.get("source"),
-				record.get("intent"),
-				json.dumps(record.get("indicators") or [], ensure_ascii=False),
-				record.get("summary"),
-				record.get("risk_score"),
-			),
-		)
-		conn.commit()
-	finally:
-		conn.close()
+	case_id = storage.create_or_get_case(
+		db_path,
+		record.get("text") or "",
+		source=record.get("source"),
+		external_id=record.get("report_id"),
+		synthetic=True,
+	)
+	intent = record.get("intent")
+	indicators = record.get("indicators") or []
+	score_details = record.get("score_details") or compute_detailed_risk_score(intent, indicators)
+	analysis = {
+		"intent": intent,
+		"indicators": indicators,
+		"summary": record.get("summary"),
+		"numeric_risk_score": record.get("risk_score", score_details.get("total_score")),
+		"score_band": score_details.get("score_band"),
+		"operational_priority": score_details.get("operational_priority"),
+		"score_details": score_details,
+		"scoring_version": record.get("scoring_version", score_details.get("scoring_version")),
+		"priority_policy_version": record.get("priority_policy_version", score_details.get("priority_policy_version")),
+		"hard_flags": record.get("hard_flags") or [],
+		"watchlist_version": record.get("watchlist_version", score_details.get("watchlist_version", watchlist.NO_WATCHLIST_VERSION)),
+		"watchlist_policy_version": record.get(
+			"watchlist_policy_version",
+			score_details.get("watchlist_policy_version", watchlist.LEGACY_WATCHLIST_POLICY_VERSION),
+		),
+	}
+	return storage.save_automated_analysis(db_path, case_id, analysis, analysis_method="rules")
 
 
 def _call_llm(text: str, api_key: str, model: str = None) -> typing.Optional[dict]:
@@ -610,12 +626,39 @@ def _rule_based_analysis(text: str) -> dict:
 	return {"intent": intent, "indicators": indicators, "summary": _short_summary(text)}
 
 
-def analyze_report(row: dict) -> dict:
+def get_score_band(risk_score: int) -> str:
+	if risk_score <= PRIORITY_LOW_MAX:
+		return "Low"
+	if risk_score <= PRIORITY_REVIEW_MAX:
+		return "Review"
+	return "Escalate"
+
+
+def get_operational_priority(risk_score: int) -> str:
+	"""Legacy score-only helper. Use determine_operational_priority for workflow priority."""
+	return get_score_band(risk_score)
+
+
+def determine_operational_priority(intent: str, risk_score: int) -> str:
+	score_band = get_score_band(risk_score)
+	intent_floor = MINIMUM_PRIORITY_BY_INTENT.get((intent or "benign").lower(), "Low")
+	if PRIORITY_RANKS[intent_floor] > PRIORITY_RANKS[score_band]:
+		return intent_floor
+	return score_band
+
+
+def determine_operational_priority_with_watchlist(intent: str, risk_score: int, indicators, hard_flags: list) -> str:
+	base_priority = determine_operational_priority(intent, risk_score)
+	final_priority, _, _ = watchlist.apply_watchlist_priority(base_priority, hard_flags, intent, indicators)
+	return final_priority
+
+
+def analyze_report(row: dict, rule_only: bool = False) -> dict:
 	text = (row.get("text") or "").strip()
 	analysis = None
 
 	api_key = os.environ.get("OPENAI_API_KEY")
-	if api_key and text:
+	if api_key and text and not rule_only:
 		result = _call_llm(text, api_key)
 		if isinstance(result, dict):
 			analysis = {
@@ -641,17 +684,70 @@ def analyze_report(row: dict) -> dict:
 	except Exception:
 		pass
 
-	return _apply_analysis_rules(text, analysis)
+	analysis = _apply_analysis_rules(text, analysis)
+	analysis["scoring_version"] = SCORING_VERSION
+	analysis["priority_policy_version"] = PRIORITY_POLICY_VERSION
+	analysis["score_details"] = compute_detailed_risk_score(analysis.get("intent"), analysis.get("indicators"))
+	_watchlist_fields = watchlist.build_analysis_watchlist_fields(
+		text,
+		analysis.get("intent"),
+		analysis.get("indicators"),
+		analysis["score_details"].get("operational_priority"),
+	)
+	analysis.update(_watchlist_fields)
+	analysis["score_details"]["operational_priority"] = _watchlist_fields["operational_priority"]
+	analysis["score_details"]["watchlist_priority_source"] = _watchlist_fields["watchlist_priority_source"]
+	analysis["score_details"]["watchlist_priority_explanation"] = _watchlist_fields["watchlist_priority_explanation"]
+	analysis["score_details"]["watchlist_policy_version"] = _watchlist_fields["watchlist_policy_version"]
+	analysis["score_details"]["watchlist_version"] = _watchlist_fields["watchlist_version"]
+	return analysis
 
 
-def compute_risk_score(intent, indicators) -> int:
-	# preserve normalization of indicators
+def _score_contribution(category: str, factor: str, points: int, reason: str, rule_id: str) -> dict:
+	return {
+		"category": category,
+		"factor": factor,
+		"points": points,
+		"reason": reason,
+		"rule_id": rule_id,
+	}
+
+
+def _triggered_rule(rule_id: str, description: str, points: int) -> dict:
+	return {"rule_id": rule_id, "description": description, "points": points}
+
+
+def compute_detailed_risk_score(intent, indicators) -> dict:
 	indicators = normalize_indicators(indicators)
+	intent_value = (intent or "benign").lower()
+	contributions = []
+	triggered_rules = []
 
-	# Start with intent contribution (reduced dominance)
-	score = INTENT_SCORES.get((intent or "benign"), 0)
+	def add(category: str, factor: str, points: int, reason: str, rule_id: str, triggered: bool = False):
+		contributions.append(_score_contribution(category, factor, points, reason, rule_id))
+		if triggered:
+			triggered_rules.append(_triggered_rule(rule_id, reason, points))
 
-	# Track presence of capability/behavior indicators for escalation rules
+	def apply_floor(current_score: int, minimum_score: int, factor: str, reason: str, rule_id: str) -> int:
+		if current_score < minimum_score:
+			points = minimum_score - current_score
+			add("combination_rule", factor, points, reason, rule_id, triggered=True)
+			return minimum_score
+		triggered_rules.append(_triggered_rule(rule_id, reason, 0))
+		return current_score
+
+	def apply_cap(current_score: int, maximum_score: int, factor: str, reason: str, rule_id: str) -> int:
+		if current_score > maximum_score:
+			points = maximum_score - current_score
+			add("combination_rule", factor, points, reason, rule_id, triggered=True)
+			return maximum_score
+		triggered_rules.append(_triggered_rule(rule_id, reason, 0))
+		return current_score
+
+	intent_points = INTENT_SCORES.get(intent_value, 0)
+	add("intent", intent_value, intent_points, f"Automated intent contributes {intent_points} point(s).", "score.intent.base")
+	score = intent_points
+
 	has_precursor = False
 	has_delivery = False
 	has_evasion = False
@@ -660,66 +756,80 @@ def compute_risk_score(intent, indicators) -> int:
 	for ind in indicators:
 		il = (ind or "").lower()
 
-		# Weighted precursor scoring: use PRECURSOR_WEIGHTS, default 1
 		if il.startswith("precursor"):
 			has_precursor = True
-			# extract chemical part after 'precursor:' if present
-			chem = ""
 			parts = il.split(":", 1)
-			if len(parts) > 1:
-				chem = parts[1].strip()
+			chem = parts[1].strip() if len(parts) > 1 else ""
 			weight = PRECURSOR_WEIGHTS.get(chem, 1)
+			add("indicator", il, weight, "Hazardous-material indicator contributes weighted risk points.", "score.indicator.precursor")
 			score += weight
-
-		# Delivery indicates capability to deliver — add fixed contribution
 		elif il.startswith("delivery"):
 			has_delivery = True
+			add("indicator", il, 3, "Delivery or exposure-route indicator contributes fixed risk points.", "score.indicator.delivery")
 			score += 3
-
-		# Scale increases risk modestly
 		elif il.startswith("scale"):
+			add("indicator", il, 1, "Scale indicator contributes a modest risk increase.", "score.indicator.scale")
 			score += 1
-
-		# Evasion increases risk and participates in escalation rules
 		elif il.startswith("evasion"):
 			has_evasion = True
+			add("indicator", il, 2, "Evasion indicator contributes concealment risk points.", "score.indicator.evasion")
 			score += 2
 
-		# Detect contamination/ingestion phrasing for minimum thresholds
 		if "ingestion/contamination" in il or "contamination" in il:
 			has_contamination = True
 
-	# Post-processing boosts and adjustments
-	# 1) Suspicious intent with delivery indicates operational capability → small boost
-	if (intent or "").lower() == "suspicious" and has_delivery:
+	if intent_value == "suspicious" and has_delivery:
+		add(
+			"combination_rule",
+			"suspicious intent plus delivery indicator",
+			1,
+			"Suspicious intent with a delivery indicator receives a small deterministic boost.",
+			"score.rule.suspicious_delivery_boost",
+			triggered=True,
+		)
 		score += 1
-	if (intent or "").lower() == "dual_use" and "context: research-to-harm" in indicators:
+	if intent_value == "dual_use" and "context: research-to-harm" in indicators:
+		add(
+			"combination_rule",
+			"dual-use research-to-harm context",
+			1,
+			"Dual-use intent with research-to-harm context receives a small deterministic boost.",
+			"score.rule.dual_use_research_to_harm_boost",
+			triggered=True,
+		)
 		score += 1
 
-	# 2) Malicious intent with precursor + delivery indicates high consequence capability → extra boost
-	if (intent or "").lower() == "malicious" and has_precursor and has_delivery:
+	if intent_value == "malicious" and has_precursor and has_delivery:
+		add(
+			"combination_rule",
+			"malicious intent plus material and delivery indicators",
+			2,
+			"Malicious intent with material and delivery indicators receives an additional deterministic boost.",
+			"score.rule.malicious_precursor_delivery_boost",
+			triggered=True,
+		)
 		score += 2
 
-	# 3) Framing (fiction/cover-story) handling: if framing indicator present alongside
-	#    precursor/delivery, ensure intent is at least suspicious for scoring purposes
 	framing_present = any(((ind or "").lower().startswith("framing")) for ind in indicators)
 	if framing_present and (has_precursor or has_delivery):
-		# Ensure framing with harmful indicators is treated with caution:
-		# - Raise local intent floor to at least 'suspicious' contribution
-		# - Enforce a minimum score of 5 so fiction framing doesn't mask capability
-		if (intent or "").lower() not in ("suspicious", "malicious"):
-			if score < INTENT_SCORES.get("suspicious", 2):
-				score = INTENT_SCORES.get("suspicious", 2)
-		# Enforce minimum score for framing-with-harm cases
-		if score < 5:
-			score = 5
+		if intent_value not in ("suspicious", "malicious"):
+			score = apply_floor(
+				score,
+				INTENT_SCORES.get("suspicious", 2),
+				"framing with harmful indicators intent floor",
+				"Fiction or cover-story framing with harmful indicators receives a cautious intent-score floor.",
+				"score.rule.framing_intent_floor",
+			)
+		score = apply_floor(
+			score,
+			5,
+			"framing with harmful indicators score floor",
+			"Fiction or cover-story framing with harmful indicators receives a minimum risk score.",
+			"score.rule.framing_minimum_score",
+		)
 
-	# 4) Safety-context dampening: if explicit safety context and no evasion,
-	#    cap clearly-benign cases at 3 to avoid over-scoring safety-oriented reports.
 	if "context: safety" in indicators and not has_evasion:
-		# Determine if strong harmful indicators exist (high-weight precursor, delivery, or evasion)
 		has_strong_harm = False
-		# consider a precursor strong if its weight >= 4
 		for ind in indicators:
 			il = (ind or "").lower()
 			if il.startswith("precursor"):
@@ -730,34 +840,89 @@ def compute_risk_score(intent, indicators) -> int:
 			if il.startswith("delivery") or il.startswith("evasion"):
 				has_strong_harm = True
 
-		# If intent is benign and no strong harmful indicators, cap score at 3
-		if (intent or "").lower() == "benign" and not has_strong_harm and score > 3:
-			score = 3
+		if intent_value == "benign" and not has_strong_harm:
+			score = apply_cap(
+				score,
+				3,
+				"benign safety context cap",
+				"Benign reports with safety context and no strong harmful indicators are capped.",
+				"score.rule.safety_context_cap",
+			)
 
-	# Combination escalation: precursor + delivery → additional capability escalation
 	if has_precursor and has_delivery:
-		# material + delivery method together significantly raise risk
+		add(
+			"combination_rule",
+			"material plus delivery indicators",
+			3,
+			"Material and delivery indicators together receive an additional deterministic escalation.",
+			"score.rule.precursor_delivery_combination",
+			triggered=True,
+		)
 		score += 3
 
-	# Ensure minimums for dangerous combinations
-	# precursor + evasion implies active concealment with dangerous material
-	if has_precursor and has_evasion and score < 5:
-		score = 5
+	if has_precursor and has_evasion:
+		score = apply_floor(
+			score,
+			5,
+			"material plus evasion floor",
+			"Material and evasion indicators together enforce a minimum risk score.",
+			"score.rule.precursor_evasion_floor",
+		)
 
-	# precursor + delivery + evasion is the highest escalation we enforce
-	if has_precursor and has_delivery and has_evasion and score < 8:
-		score = 8
+	if has_precursor and has_delivery and has_evasion:
+		score = apply_floor(
+			score,
+			8,
+			"material plus delivery plus evasion floor",
+			"Material, delivery, and evasion indicators together enforce a higher minimum risk score.",
+			"score.rule.precursor_delivery_evasion_floor",
+		)
 
-	# contamination (e.g., water/ingestion) enforces minimum serious risk
-	if has_contamination and score < 5:
-		score = 5
+	if has_contamination:
+		score = apply_floor(
+			score,
+			5,
+			"contamination route floor",
+			"Contamination-route indicators enforce a minimum risk score.",
+			"score.rule.contamination_floor",
+		)
 
-	# Soft-cap heavily stacked escalation paths so they stay high without ballooning.
 	escalation_count = sum(1 for present in (has_precursor, has_delivery, has_evasion, has_contamination) if present)
 	if escalation_count >= 3 and score > 12:
-		score = 12 + (score - 12) // 2
+		soft_capped_score = 12 + (score - 12) // 2
+		add(
+			"combination_rule",
+			"stacked escalation soft cap",
+			soft_capped_score - score,
+			"Stacked escalation paths are softened to keep scores high without unlimited growth.",
+			"score.rule.stacked_escalation_soft_cap",
+			triggered=True,
+		)
+		score = soft_capped_score
 
-	return score
+	score_band = get_score_band(score)
+	operational_priority = determine_operational_priority(intent_value, score)
+	explanation = (
+		f"Score {score} is {score_band}. Automated intent '{intent_value}' sets a minimum "
+		f"workflow priority of {MINIMUM_PRIORITY_BY_INTENT.get(intent_value, 'Low')}; final "
+		f"operational priority is {operational_priority}."
+	)
+
+	return {
+		"total_score": score,
+		"score_band": score_band,
+		"operational_priority": operational_priority,
+		"scoring_version": SCORING_VERSION,
+		"priority_policy_version": PRIORITY_POLICY_VERSION,
+		"normalized_indicators": indicators,
+		"contributions": contributions,
+		"triggered_rules": triggered_rules,
+		"explanation": explanation,
+	}
+
+
+def compute_risk_score(intent, indicators) -> int:
+	return compute_detailed_risk_score(intent, indicators)["total_score"]
 
 
 def calculate_risk_score(intent, indicators) -> int:
@@ -766,4 +931,3 @@ def calculate_risk_score(intent, indicators) -> int:
 
 if __name__ == "__main__":
 	main()
-
